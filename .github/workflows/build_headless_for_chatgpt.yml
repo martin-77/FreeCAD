@@ -24,46 +24,16 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Install Pixi
+      - name: Install repository Pixi environment
         uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
         with:
           pixi-version: ${{ env.PIXI_VERSION }}
           cache: true
 
-      - name: Create minimal build environment
-        shell: bash
-        run: |
-          cat > headless-pixi.toml <<'EOF'
-          [workspace]
-          channels = ["conda-forge"]
-          platforms = ["linux-64"]
-
-          [dependencies]
-          python = ">=3.11,<3.12"
-          cmake = ">=3.22"
-          ninja = "*"
-          cxx-compiler = "*"
-          c-compiler = "*"
-          swig = ">=4.3,<4.4"
-          eigen = ">=3.3,<5"
-          fmt = ">=12.1,<12.2"
-          icu = "*"
-          libboost-devel = "*"
-          occt = ">=7.8,<7.9"
-          pycxx = "*"
-          qt6-main = ">=6.8,<6.9"
-          xerces-c = "*"
-          yaml-cpp = "*"
-          zlib = "*"
-          freetype = "*"
-          ccache = "*"
-          EOF
-          pixi install --manifest-path headless-pixi.toml
-
       - name: Configure headless FreeCAD
         shell: bash
         run: |
-          pixi run --manifest-path headless-pixi.toml bash -lc '
+          pixi run bash -lc '
             cmake -S . -B build-headless -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX="$PWD/freecad-headless" \
@@ -110,44 +80,111 @@ jobs:
       - name: Build and install
         shell: bash
         run: |
-          pixi run --manifest-path headless-pixi.toml bash -lc '
+          pixi run bash -lc '
             cmake --build build-headless --parallel 2
             cmake --install build-headless
           '
 
-      - name: Add runtime libraries used by the headless install
+      - name: Smoke test in build environment
         shell: bash
         run: |
-          PIXI_PREFIX="$(pixi run --manifest-path headless-pixi.toml bash -lc 'printf %s "$CONDA_PREFIX"')"
-          mkdir -p freecad-headless/runtime-lib
-          # Copy only libraries resolved by FreeCADCmd from the Pixi environment.
-          if [ -x freecad-headless/bin/FreeCADCmd ]; then
-            ldd freecad-headless/bin/FreeCADCmd | awk '/=> \/.*\.pixi/ {print $3}' | sort -u > /tmp/fc-libs.txt || true
-            while IFS= read -r lib; do
-              [ -f "$lib" ] && cp -L "$lib" freecad-headless/runtime-lib/
-            done < /tmp/fc-libs.txt
-          fi
-          echo "$PIXI_PREFIX" > freecad-headless/BUILD_PIXI_PREFIX.txt
+          pixi run bash -lc '
+            export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; print(FreeCAD.Version()); s=Part.makeBox(10,20,30); print(s.Volume); assert abs(s.Volume-6000.0)<1e-6"
+          '
 
-      - name: Create launcher and smoke test
+      - name: Collect minimal runtime dependencies
+        shell: bash
+        run: |
+          pixi run python - <<'PY'
+          import os, pathlib, re, shutil, subprocess
+
+          root = pathlib.Path('freecad-headless').resolve()
+          prefix = pathlib.Path(os.environ['CONDA_PREFIX']).resolve()
+          runtime = root / 'runtime-lib'
+          runtime.mkdir(exist_ok=True)
+
+          # Recursively inspect every installed ELF binary/library plus each newly
+          # discovered Conda library. Copy only dependencies originating in the
+          # Pixi prefix; system glibc/loader remain supplied by the host.
+          queue = []
+          for p in root.rglob('*'):
+              if p.is_file():
+                  try:
+                      magic = p.read_bytes()[:4]
+                  except OSError:
+                      continue
+                  if magic == b'\x7fELF':
+                      queue.append(p)
+
+          seen = set()
+          copied = {}
+          dep_re = re.compile(r'=>\s+(/[^ ]+)')
+
+          while queue:
+              obj = queue.pop()
+              key = str(obj.resolve())
+              if key in seen:
+                  continue
+              seen.add(key)
+              try:
+                  out = subprocess.check_output(['ldd', str(obj)], text=True, stderr=subprocess.STDOUT)
+              except Exception:
+                  continue
+              for m in dep_re.finditer(out):
+                  dep = pathlib.Path(m.group(1))
+                  try:
+                      dep_res = dep.resolve()
+                  except OSError:
+                      continue
+                  if not str(dep_res).startswith(str(prefix) + os.sep):
+                      continue
+                  name = dep_res.name
+                  dst = runtime / name
+                  if name not in copied:
+                      shutil.copy2(dep_res, dst)
+                      copied[name] = str(dep_res)
+                      queue.append(dst)
+
+          # FreeCAD embeds Python. Copy the Python 3.11 standard library needed
+          # for normal scripting, excluding bulky tests and site-packages.
+          py_src = prefix / 'lib' / 'python3.11'
+          py_dst = root / 'python' / 'lib' / 'python3.11'
+          if py_src.exists():
+              def ignore(path, names):
+                  blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
+                  return [n for n in names if n in blocked or n == '__pycache__']
+              shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
+
+          # Preserve provenance for debugging/rebuilding.
+          (root / 'RUNTIME_LIBS.txt').write_text(
+              '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n',
+              encoding='utf-8'
+          )
+          print(f'Copied {len(copied)} runtime libraries')
+          PY
+
+      - name: Create portable launcher and test artifact
         shell: bash
         run: |
           cat > freecad-headless/freecadcmd.sh <<'EOF'
           #!/usr/bin/env bash
+          set -e
           HERE="$(cd "$(dirname "$0")" && pwd)"
           export LD_LIBRARY_PATH="$HERE/runtime-lib:$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export PYTHONPATH="$HERE/lib${PYTHONPATH:+:$PYTHONPATH}"
+          export PYTHONHOME="$HERE/python"
+          export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
           exec "$HERE/bin/FreeCADCmd" "$@"
           EOF
           chmod +x freecad-headless/freecadcmd.sh
 
-          # First test within Pixi, where all runtime deps are definitely available.
-          pixi run --manifest-path headless-pixi.toml bash -lc '
-            export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$LD_LIBRARY_PATH"
-            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; print(FreeCAD.Version()); print(Part.makeBox(10,20,30).Volume)"
-          '
+          # Test without exposing the Pixi runtime library path. This is the
+          # important portability check for the artifact itself.
+          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
+            LD_LIBRARY_PATH="" \
+            ./freecad-headless/freecadcmd.sh -c \
+            "import FreeCAD, Part; print(FreeCAD.Version()); s=Part.makeCylinder(6.21,20); print(round(s.Volume,3)); assert s.Volume>2400"
 
-          # Record file list and size for later trimming.
           du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
           find freecad-headless -type f | sort > freecad-headless/FILELIST.txt
 
