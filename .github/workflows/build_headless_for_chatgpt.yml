@@ -1,0 +1,161 @@
+name: Build Headless FreeCAD for CAD checks
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build_headless_for_chatgpt.yml'
+
+permissions:
+  contents: read
+
+env:
+  PIXI_VERSION: v0.68.1
+
+jobs:
+  build-headless-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout FreeCAD including submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Pixi
+        uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+        with:
+          pixi-version: ${{ env.PIXI_VERSION }}
+          cache: true
+
+      - name: Create minimal build environment
+        shell: bash
+        run: |
+          cat > headless-pixi.toml <<'EOF'
+          [workspace]
+          channels = ["conda-forge"]
+          platforms = ["linux-64"]
+
+          [dependencies]
+          python = ">=3.11,<3.12"
+          cmake = ">=3.22"
+          ninja = "*"
+          cxx-compiler = "*"
+          c-compiler = "*"
+          swig = ">=4.3,<4.4"
+          eigen = ">=3.3,<5"
+          fmt = ">=12.1,<12.2"
+          icu = "*"
+          libboost-devel = "*"
+          occt = ">=7.8,<7.9"
+          pycxx = "*"
+          qt6-main = ">=6.8,<6.9"
+          xerces-c = "*"
+          yaml-cpp = "*"
+          zlib = "*"
+          freetype = "*"
+          ccache = "*"
+          EOF
+          pixi install --manifest-path headless-pixi.toml
+
+      - name: Configure headless FreeCAD
+        shell: bash
+        run: |
+          pixi run --manifest-path headless-pixi.toml bash -lc '
+            cmake -S . -B build-headless -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="$PWD/freecad-headless" \
+              -DBUILD_GUI=OFF \
+              -DBUILD_FEM=OFF \
+              -DBUILD_TEMPLATE=OFF \
+              -DBUILD_ADDONMGR=OFF \
+              -DBUILD_BIM=OFF \
+              -DBUILD_DRAFT=OFF \
+              -DBUILD_HELP=OFF \
+              -DBUILD_IMPORT=ON \
+              -DBUILD_INSPECTION=OFF \
+              -DBUILD_MATERIAL=OFF \
+              -DBUILD_MESH=ON \
+              -DBUILD_MESH_PART=OFF \
+              -DBUILD_FLAT_MESH=OFF \
+              -DBUILD_OPENSCAD=OFF \
+              -DBUILD_PART=ON \
+              -DBUILD_PART_DESIGN=ON \
+              -DBUILD_CAM=OFF \
+              -DBUILD_ASSEMBLY=OFF \
+              -DBUILD_PLOT=OFF \
+              -DBUILD_POINTS=OFF \
+              -DBUILD_REVERSEENGINEERING=OFF \
+              -DBUILD_ROBOT=OFF \
+              -DBUILD_SHOW=OFF \
+              -DBUILD_SKETCHER=ON \
+              -DBUILD_SPREADSHEET=OFF \
+              -DBUILD_START=OFF \
+              -DBUILD_TEST=OFF \
+              -DBUILD_MEASURE=OFF \
+              -DBUILD_TECHDRAW=OFF \
+              -DBUILD_TUX=OFF \
+              -DBUILD_WEB=OFF \
+              -DBUILD_SURFACE=OFF \
+              -DENABLE_DEVELOPER_TESTS=OFF \
+              -DFREECAD_USE_PCL=OFF \
+              -DFREECAD_USE_EXTERNAL_SMESH=OFF \
+              -DBUILD_FEM_NETGEN=OFF \
+              -DFREECAD_USE_3DCONNEXION_LEGACY=OFF \
+              -DINSTALL_TO_SITEPACKAGES=OFF
+          '
+
+      - name: Build and install
+        shell: bash
+        run: |
+          pixi run --manifest-path headless-pixi.toml bash -lc '
+            cmake --build build-headless --parallel 2
+            cmake --install build-headless
+          '
+
+      - name: Add runtime libraries used by the headless install
+        shell: bash
+        run: |
+          PIXI_PREFIX="$(pixi run --manifest-path headless-pixi.toml bash -lc 'printf %s "$CONDA_PREFIX"')"
+          mkdir -p freecad-headless/runtime-lib
+          # Copy only libraries resolved by FreeCADCmd from the Pixi environment.
+          if [ -x freecad-headless/bin/FreeCADCmd ]; then
+            ldd freecad-headless/bin/FreeCADCmd | awk '/=> \/.*\.pixi/ {print $3}' | sort -u > /tmp/fc-libs.txt || true
+            while IFS= read -r lib; do
+              [ -f "$lib" ] && cp -L "$lib" freecad-headless/runtime-lib/
+            done < /tmp/fc-libs.txt
+          fi
+          echo "$PIXI_PREFIX" > freecad-headless/BUILD_PIXI_PREFIX.txt
+
+      - name: Create launcher and smoke test
+        shell: bash
+        run: |
+          cat > freecad-headless/freecadcmd.sh <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/runtime-lib:$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PYTHONPATH="$HERE/lib${PYTHONPATH:+:$PYTHONPATH}"
+          exec "$HERE/bin/FreeCADCmd" "$@"
+          EOF
+          chmod +x freecad-headless/freecadcmd.sh
+
+          # First test within Pixi, where all runtime deps are definitely available.
+          pixi run --manifest-path headless-pixi.toml bash -lc '
+            export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$LD_LIBRARY_PATH"
+            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; print(FreeCAD.Version()); print(Part.makeBox(10,20,30).Volume)"
+          '
+
+          # Record file list and size for later trimming.
+          du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
+          find freecad-headless -type f | sort > freecad-headless/FILELIST.txt
+
+      - name: Upload headless FreeCAD
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecad-headless-linux-x86_64
+          path: freecad-headless/
+          compression-level: 6
+          retention-days: 14
+          if-no-files-found: error
