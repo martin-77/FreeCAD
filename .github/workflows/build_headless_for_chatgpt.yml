@@ -30,6 +30,21 @@ jobs:
           pixi-version: ${{ env.PIXI_VERSION }}
           cache: true
 
+      - name: Prepare headless Qt helpers
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cMake/FreeCAD_Helpers/SetupQt.cmake')
+          s = p.read_text()
+          old = 'set(FREECAD_QT_COMPONENTS Core Concurrent Network Xml)'
+          new = 'set(FREECAD_QT_COMPONENTS Core Concurrent Network Xml LinguistTools)'
+          if old not in s:
+              raise SystemExit('Expected SetupQt.cmake component line not found')
+          p.write_text(s.replace(old, new, 1))
+          print('Enabled Qt LinguistTools for BUILD_GUI=OFF headless build')
+          PY
+
       - name: Configure headless FreeCAD
         shell: bash
         run: |
@@ -46,7 +61,7 @@ jobs:
               -DBUILD_HELP=OFF \
               -DBUILD_IMPORT=ON \
               -DBUILD_INSPECTION=OFF \
-              -DBUILD_MATERIAL=OFF \
+              -DBUILD_MATERIAL=ON \
               -DBUILD_MESH=ON \
               -DBUILD_MESH_PART=OFF \
               -DBUILD_FLAT_MESH=OFF \
@@ -104,9 +119,6 @@ jobs:
           runtime = root / 'runtime-lib'
           runtime.mkdir(exist_ok=True)
 
-          # Recursively inspect every installed ELF binary/library plus each newly
-          # discovered Conda library. Copy only dependencies originating in the
-          # Pixi prefix; system glibc/loader remain supplied by the host.
           queue = []
           for p in root.rglob('*'):
               if p.is_file():
@@ -146,8 +158,6 @@ jobs:
                       copied[name] = str(dep_res)
                       queue.append(dst)
 
-          # FreeCAD embeds Python. Copy the Python 3.11 standard library needed
-          # for normal scripting, excluding bulky tests and site-packages.
           py_src = prefix / 'lib' / 'python3.11'
           py_dst = root / 'python' / 'lib' / 'python3.11'
           if py_src.exists():
@@ -156,7 +166,6 @@ jobs:
                   return [n for n in names if n in blocked or n == '__pycache__']
               shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
 
-          # Preserve provenance for debugging/rebuilding.
           (root / 'RUNTIME_LIBS.txt').write_text(
               '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n',
               encoding='utf-8'
@@ -178,8 +187,6 @@ jobs:
           EOF
           chmod +x freecad-headless/freecadcmd.sh
 
-          # Test without exposing the Pixi runtime library path. This is the
-          # important portability check for the artifact itself.
           env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
             LD_LIBRARY_PATH="" \
             ./freecad-headless/freecadcmd.sh -c \
