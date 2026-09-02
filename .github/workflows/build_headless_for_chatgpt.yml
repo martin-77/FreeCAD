@@ -117,6 +117,19 @@ jobs:
           prefix = pathlib.Path(os.environ['CONDA_PREFIX']).resolve()
           runtime = root / 'runtime-lib'
           runtime.mkdir(exist_ok=True)
+          pyroot = root / 'python'
+          (pyroot / 'bin').mkdir(parents=True, exist_ok=True)
+
+          pyexe_src = prefix / 'bin' / 'python3.11'
+          pyexe_dst = pyroot / 'bin' / 'python3.11'
+          shutil.copy2(pyexe_src, pyexe_dst)
+
+          py_src = prefix / 'lib' / 'python3.11'
+          py_dst = pyroot / 'lib' / 'python3.11'
+          def ignore(path, names):
+              blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
+              return [n for n in names if n in blocked or n == '__pycache__']
+          shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
 
           def is_elf(p):
               try:
@@ -124,14 +137,10 @@ jobs:
               except OSError:
                   return False
 
+          # Scan FreeCAD, the copied Python executable and all copied Python
+          # extension modules so their Conda/Pixi shared-library dependencies
+          # are bundled too.
           queue = [p for p in root.rglob('*') if is_elf(p)]
-          pyroot = root / 'python'
-          (pyroot / 'bin').mkdir(parents=True, exist_ok=True)
-          pyexe_src = prefix / 'bin' / 'python3.11'
-          pyexe_dst = pyroot / 'bin' / 'python3.11'
-          shutil.copy2(pyexe_src, pyexe_dst)
-          queue.append(pyexe_dst)
-
           seen = set()
           copied = {}
           aliases = {}
@@ -167,22 +176,14 @@ jobs:
                   if needed_name != real_name:
                       aliases[needed_name] = real_name
 
-          # GitHub Actions artifacts do not preserve symlink semantics reliably.
-          # Store every SONAME alias as a real file so the downloaded artifact
-          # still contains loader-visible names such as libQt6Core.so.6.
+          # GitHub artifact ZIPs do not preserve our loader symlinks. Materialize
+          # SONAME aliases as regular files instead.
           for alias, target in sorted(aliases.items()):
               alias_path = runtime / alias
               target_path = runtime / target
               if alias_path.exists() or alias_path.is_symlink():
                   alias_path.unlink()
               shutil.copy2(target_path, alias_path)
-
-          py_src = prefix / 'lib' / 'python3.11'
-          py_dst = pyroot / 'lib' / 'python3.11'
-          def ignore(path, names):
-              blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
-              return [n for n in names if n in blocked or n == '__pycache__']
-          shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
 
           (root / 'RUNTIME_LIBS.txt').write_text(
               '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n', encoding='utf-8')
@@ -191,19 +192,9 @@ jobs:
           print(f'Copied {len(copied)} runtime libraries and materialized {len(aliases)} aliases')
           PY
 
-      - name: Create portable launchers and test artifact
+      - name: Create portable launcher and test artifact
         shell: bash
         run: |
-          cat > freecad-headless/freecadcmd.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -e
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$HERE/runtime-lib:$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export PYTHONHOME="$HERE/python"
-          export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
-          exec "$HERE/bin/FreeCADCmd" "$@"
-          EOF
-
           cat > freecad-headless/freecad-python.sh <<'EOF'
           #!/usr/bin/env bash
           set -e
@@ -213,21 +204,29 @@ jobs:
           export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
           exec "$HERE/python/bin/python3.11" "$@"
           EOF
+
+          # Compatibility alias for our automation: use the relocatable bundled
+          # Python interpreter rather than FreeCADCmd, whose embedded Python
+          # prefix points back to the build runner.
+          cat > freecad-headless/freecadcmd.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          exec "$HERE/freecad-python.sh" "$@"
+          EOF
           chmod +x freecad-headless/freecadcmd.sh freecad-headless/freecad-python.sh
 
           rm -rf /tmp/freecad-portable-test
           cp -a freecad-headless /tmp/freecad-portable-test
           env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
             LD_LIBRARY_PATH="" \
-            /tmp/freecad-portable-test/freecadcmd.sh -c \
-            "import FreeCAD, Part; s=Part.makeCylinder(6.21,20); print(FreeCAD.Version()); assert s.Volume>2400"
-
-          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
-            LD_LIBRARY_PATH="" \
             /tmp/freecad-portable-test/freecad-python.sh - <<'PY'
           import os, sys, tempfile
           import FreeCAD, Part
           assert '/home/runner/' not in sys.prefix, sys.prefix
+          print('VERSION', FreeCAD.Version())
+          cylinder = Part.makeCylinder(6.21, 20)
+          assert cylinder.Volume > 2400
           shape = Part.makeBox(10, 20, 30)
           assert abs(shape.Volume - 6000.0) < 1e-6
           fd, path = tempfile.mkstemp(suffix='.step')
@@ -239,8 +238,13 @@ jobs:
               assert abs(reread.Volume - 6000.0) < 1e-4
           finally:
               os.unlink(path)
-          print('Portable Python + FreeCAD + STEP roundtrip OK')
+          print('Portable Python + FreeCAD + Part + STEP roundtrip OK')
           PY
+
+          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
+            LD_LIBRARY_PATH="" \
+            /tmp/freecad-portable-test/freecadcmd.sh -c \
+            "import FreeCAD, Part; s=Part.makeBox(2,3,4); print(s.Volume); assert abs(s.Volume-24)<1e-6"
 
           du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
           find freecad-headless -type f -o -type l | sort > freecad-headless/FILELIST.txt
