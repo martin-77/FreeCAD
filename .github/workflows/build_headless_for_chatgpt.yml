@@ -104,142 +104,178 @@ jobs:
         run: |
           pixi run bash -lc '
             export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; s=Part.makeBox(10,20,30); print(FreeCAD.Version()); print(s.Volume); assert abs(s.Volume-6000.0)<1e-6"
+            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; s=Part.makeBox(10,20,30); print(FreeCAD.Version()); print(s.Volume); assert s.isValid(); assert abs(s.Volume-6000.0)<1e-6"
           '
 
-      - name: Collect portable runtime
+      # FreeCAD and OpenCascade load a number of libraries and resource files at
+      # runtime that are not visible in a simple `ldd FreeCADCmd` traversal.
+      # Keep the complete Pixi runtime lib/share trees instead of guessing which
+      # transitive plugins/resources a future CAD operation might need.
+      - name: Collect self-contained runtime
         shell: bash
         run: |
-          pixi run python - <<'PY'
-          import os, pathlib, re, shutil, subprocess
+          pixi run bash -lc '
+            set -euo pipefail
+            mkdir -p freecad-headless/runtime/bin
+            cp -a "$CONDA_PREFIX/lib" freecad-headless/runtime/lib
+            cp -a "$CONDA_PREFIX/share" freecad-headless/runtime/share
+            cp -a "$CONDA_PREFIX/bin/python3.11" freecad-headless/runtime/bin/python3.11
 
-          root = pathlib.Path('freecad-headless').resolve()
-          prefix = pathlib.Path(os.environ['CONDA_PREFIX']).resolve()
-          runtime = root / 'runtime-lib'
-          runtime.mkdir(exist_ok=True)
-          pyroot = root / 'python'
-          (pyroot / 'bin').mkdir(parents=True, exist_ok=True)
+            # Keep certificates and common OpenCascade/Qt runtime metadata if
+            # supplied outside lib/share by a package.
+            for d in ssl etc; do
+              if [ -d "$CONDA_PREFIX/$d" ]; then
+                cp -a "$CONDA_PREFIX/$d" "freecad-headless/runtime/$d"
+              fi
+            done
+          '
 
-          pyexe_src = prefix / 'bin' / 'python3.11'
-          pyexe_dst = pyroot / 'bin' / 'python3.11'
-          shutil.copy2(pyexe_src, pyexe_dst)
-
-          py_src = prefix / 'lib' / 'python3.11'
-          py_dst = pyroot / 'lib' / 'python3.11'
-          def ignore(path, names):
-              blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
-              return [n for n in names if n in blocked or n == '__pycache__']
-          shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
-
-          def is_elf(p):
-              try:
-                  return p.is_file() and p.read_bytes()[:4] == b'\x7fELF'
-              except OSError:
-                  return False
-
-          queue = [p for p in root.rglob('*') if is_elf(p)]
-          seen = set()
-          copied = {}
-          aliases = {}
-          dep_re = re.compile(r'^\s*([^\s]+)\s+=>\s+(/[^ ]+)', re.M)
-
-          while queue:
-              obj = queue.pop()
-              try:
-                  key = str(obj.resolve())
-              except OSError:
-                  continue
-              if key in seen:
-                  continue
-              seen.add(key)
-              try:
-                  out = subprocess.check_output(['ldd', str(obj)], text=True, stderr=subprocess.STDOUT)
-              except Exception:
-                  continue
-              for m in dep_re.finditer(out):
-                  needed_name, dep_path = m.group(1), pathlib.Path(m.group(2))
-                  try:
-                      dep_res = dep_path.resolve()
-                  except OSError:
-                      continue
-                  if not str(dep_res).startswith(str(prefix) + os.sep):
-                      continue
-                  real_name = dep_res.name
-                  dst = runtime / real_name
-                  if real_name not in copied:
-                      shutil.copy2(dep_res, dst)
-                      copied[real_name] = str(dep_res)
-                      queue.append(dst)
-                  if needed_name != real_name:
-                      aliases[needed_name] = real_name
-
-          for alias, target in sorted(aliases.items()):
-              alias_path = runtime / alias
-              target_path = runtime / target
-              if alias_path.exists() or alias_path.is_symlink():
-                  alias_path.unlink()
-              shutil.copy2(target_path, alias_path)
-
-          (root / 'RUNTIME_LIBS.txt').write_text(
-              '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n', encoding='utf-8')
-          (root / 'RUNTIME_ALIASES.txt').write_text(
-              '\n'.join(f'{k}\t{v}' for k, v in sorted(aliases.items())) + '\n', encoding='utf-8')
-          print(f'Copied {len(copied)} runtime libraries and materialized {len(aliases)} aliases')
-          PY
-
-      - name: Create portable launcher and test artifact
+      - name: Create launchers and CAD validation suite
         shell: bash
         run: |
+          cat > freecad-headless/env.sh <<'EOF'
+          #!/usr/bin/env bash
+          FREECAD_PORTABLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export FREECAD_PORTABLE_ROOT
+          export PATH="$FREECAD_PORTABLE_ROOT/runtime/bin:$FREECAD_PORTABLE_ROOT/bin${PATH:+:$PATH}"
+          export LD_LIBRARY_PATH="$FREECAD_PORTABLE_ROOT/lib:$FREECAD_PORTABLE_ROOT/runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PYTHONHOME="$FREECAD_PORTABLE_ROOT/runtime"
+          export PYTHONPATH="$FREECAD_PORTABLE_ROOT/lib:$FREECAD_PORTABLE_ROOT/Mod${PYTHONPATH:+:$PYTHONPATH}"
+          export XDG_DATA_DIRS="$FREECAD_PORTABLE_ROOT/runtime/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+          [ -d "$FREECAD_PORTABLE_ROOT/runtime/lib/qt6/plugins" ] && export QT_PLUGIN_PATH="$FREECAD_PORTABLE_ROOT/runtime/lib/qt6/plugins"
+          [ -f "$FREECAD_PORTABLE_ROOT/runtime/ssl/cacert.pem" ] && export SSL_CERT_FILE="$FREECAD_PORTABLE_ROOT/runtime/ssl/cacert.pem"
+          unset CONDA_PREFIX CONDA_DEFAULT_ENV
+          EOF
+
           cat > freecad-headless/freecad-python.sh <<'EOF'
           #!/usr/bin/env bash
-          set -e
+          set -euo pipefail
           HERE="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$HERE/runtime-lib:$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export PYTHONHOME="$HERE/python"
-          export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
-          exec "$HERE/python/bin/python3.11" "$@"
+          # shellcheck disable=SC1091
+          source "$HERE/env.sh"
+          exec "$HERE/runtime/bin/python3.11" "$@"
           EOF
 
           cat > freecad-headless/freecadcmd.sh <<'EOF'
           #!/usr/bin/env bash
-          set -e
+          set -euo pipefail
           HERE="$(cd "$(dirname "$0")" && pwd)"
-          exec "$HERE/freecad-python.sh" "$@"
+          # shellcheck disable=SC1091
+          source "$HERE/env.sh"
+          exec "$HERE/bin/FreeCADCmd" "$@"
           EOF
-          chmod +x freecad-headless/freecadcmd.sh freecad-headless/freecad-python.sh
 
-          rm -rf /tmp/freecad-portable-test
-          cp -a freecad-headless /tmp/freecad-portable-test
-          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
-            LD_LIBRARY_PATH="" \
-            /tmp/freecad-portable-test/freecad-python.sh - <<'PY'
-          import os, sys, tempfile
-          import FreeCAD, Part
-          assert '/home/runner/' not in sys.prefix, sys.prefix
-          print('VERSION', FreeCAD.Version())
-          cylinder = Part.makeCylinder(6.21, 20)
-          assert cylinder.Volume > 2400
-          shape = Part.makeBox(10, 20, 30)
-          assert abs(shape.Volume - 6000.0) < 1e-6
-          fd, path = tempfile.mkstemp(suffix='.step')
-          os.close(fd)
-          try:
-              shape.exportStep(path)
-              reread = Part.read(path)
+          cat > freecad-headless/validate-cad.py <<'PY'
+          """Portable FreeCAD acceptance test used by CI and after extraction."""
+          from __future__ import annotations
+
+          import math
+          import os
+          import tempfile
+          from pathlib import Path
+
+          import FreeCAD
+          import Part
+
+
+          def close_if_open(name: str) -> None:
+              if FreeCAD.getDocument(name) is not None:
+                  FreeCAD.closeDocument(name)
+
+
+          with tempfile.TemporaryDirectory(prefix="freecad-portable-") as tmp:
+              tmpdir = Path(tmp)
+              fcstd = tmpdir / "roundtrip.FCStd"
+              step = tmpdir / "roundtrip.step"
+              stl = tmpdir / "roundtrip.stl"
+
+              # Non-trivial BRep: fused box+cylinder with a through-hole.
+              base = Part.makeBox(40, 30, 12)
+              boss = Part.makeCylinder(8, 18, FreeCAD.Vector(20, 15, 12))
+              hole = Part.makeCylinder(3, 30, FreeCAD.Vector(20, 15, 0))
+              shape = base.fuse(boss).cut(hole)
+              assert shape.isValid(), "constructed BRep is invalid"
+              assert shape.Volume > 0
+              bbox = shape.BoundBox
+              assert math.isclose(bbox.XLength, 40.0, abs_tol=1e-7)
+              assert math.isclose(bbox.YLength, 30.0, abs_tol=1e-7)
+              assert math.isclose(bbox.ZLength, 30.0, abs_tol=1e-7)
+
+              # Native FCStd save/reopen.
+              doc = FreeCAD.newDocument("PortableRoundtrip")
+              obj = doc.addObject("PartDesign::Feature", "Fixture")
+              obj.Label = "Portable CAD validation fixture"
+              obj.addProperty("App::PropertyLength", "ReferenceLength", "Validation")
+              obj.ReferenceLength = 40
+              obj.Shape = shape
+              doc.recompute()
+              doc.saveAs(str(fcstd))
+              expected_volume = obj.Shape.Volume
+              FreeCAD.closeDocument(doc.Name)
+
+              reopened = FreeCAD.openDocument(str(fcstd))
+              loaded = reopened.getObject("Fixture")
+              assert loaded is not None
+              assert loaded.Shape.isValid()
+              assert math.isclose(loaded.Shape.Volume, expected_volume, rel_tol=0, abs_tol=1e-6)
+              assert math.isclose(loaded.ReferenceLength.Value, 40.0, abs_tol=1e-9)
+              FreeCAD.closeDocument(reopened.Name)
+
+              # STEP export/import through OpenCascade.
+              shape.exportStep(str(step))
+              reread = Part.read(str(step))
               assert reread.isValid()
-              assert abs(reread.Volume - 6000.0) < 1e-4
-          finally:
-              os.unlink(path)
-          print('Portable Python + FreeCAD + Part + STEP roundtrip OK')
+              assert math.isclose(reread.Volume, expected_volume, rel_tol=0, abs_tol=1e-3)
+
+              # STL tessellation/export; verify that a non-empty mesh file exists.
+              shape.exportStl(str(stl))
+              assert stl.stat().st_size > 100
+
+              print("FreeCAD version:", FreeCAD.Version())
+              print("FCStd bytes:", fcstd.stat().st_size)
+              print("STEP bytes:", step.stat().st_size)
+              print("STL bytes:", stl.stat().st_size)
+              print("Volume:", expected_volume)
+              print("Portable FCStd + STEP + STL CAD validation OK")
           PY
 
-          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
-            LD_LIBRARY_PATH="" \
+          chmod +x freecad-headless/env.sh freecad-headless/freecad-python.sh freecad-headless/freecadcmd.sh
+
+      - name: Test relocated artifact with clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/freecad-portable-test
+          cp -a freecad-headless /tmp/freecad-portable-test
+
+          # Poison/remove build-environment variables so accidental dependency
+          # leakage from Pixi is caught here.
+          env -i \
+            HOME="$HOME" \
+            USER="$USER" \
+            PATH="/usr/bin:/bin" \
+            LANG="C.UTF-8" \
+            /tmp/freecad-portable-test/freecad-python.sh \
+            /tmp/freecad-portable-test/validate-cad.py
+
+          env -i \
+            HOME="$HOME" \
+            USER="$USER" \
+            PATH="/usr/bin:/bin" \
+            LANG="C.UTF-8" \
             /tmp/freecad-portable-test/freecadcmd.sh -c \
-            "import FreeCAD, Part; s=Part.makeBox(2,3,4); print(s.Volume); assert abs(s.Volume-24)<1e-6"
+            "import FreeCAD, Part; s=Part.makeBox(2,3,4); assert s.isValid(); print(s.Volume); assert abs(s.Volume-24)<1e-6"
+
+          # Fail if the packaged FreeCAD/runtime still references the runner's
+          # Pixi environment in an ELF dependency path.
+          if grep -RIl --binary-files=text "$GITHUB_WORKSPACE/.pixi" /tmp/freecad-portable-test/bin /tmp/freecad-portable-test/lib 2>/dev/null | head -1 | grep -q .; then
+            echo "Found absolute build-environment prefix embedded in portable FreeCAD files" >&2
+            grep -RIl --binary-files=text "$GITHUB_WORKSPACE/.pixi" /tmp/freecad-portable-test/bin /tmp/freecad-portable-test/lib 2>/dev/null | head -20 >&2
+            exit 1
+          fi
 
           du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
-          find freecad-headless -type f -o -type l | sort > freecad-headless/FILELIST.txt
+          find freecad-headless \( -type f -o -type l \) -print | sort > freecad-headless/FILELIST.txt
 
       - name: Upload headless FreeCAD
         uses: actions/upload-artifact@v4
@@ -249,5 +285,3 @@ jobs:
           compression-level: 6
           retention-days: 14
           if-no-files-found: error
-
-# Rebuild marker: portable artifact validation 2026-09-02
