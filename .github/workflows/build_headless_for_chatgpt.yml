@@ -137,9 +137,6 @@ jobs:
               except OSError:
                   return False
 
-          # Scan FreeCAD, the copied Python executable and all copied Python
-          # extension modules so their Conda/Pixi shared-library dependencies
-          # are bundled too.
           queue = [p for p in root.rglob('*') if is_elf(p)]
           seen = set()
           copied = {}
@@ -176,8 +173,6 @@ jobs:
                   if needed_name != real_name:
                       aliases[needed_name] = real_name
 
-          # GitHub artifact ZIPs do not preserve our loader symlinks. Materialize
-          # SONAME aliases as regular files instead.
           for alias, target in sorted(aliases.items()):
               alias_path = runtime / alias
               target_path = runtime / target
@@ -205,9 +200,6 @@ jobs:
           exec "$HERE/python/bin/python3.11" "$@"
           EOF
 
-          # Compatibility alias for our automation: use the relocatable bundled
-          # Python interpreter rather than FreeCADCmd, whose embedded Python
-          # prefix points back to the build runner.
           cat > freecad-headless/freecadcmd.sh <<'EOF'
           #!/usr/bin/env bash
           set -e
@@ -257,3 +249,5 @@ jobs:
           compression-level: 6
           retention-days: 14
           if-no-files-found: error
+
+# Rebuild marker: portable artifact validation 2026-09-02
