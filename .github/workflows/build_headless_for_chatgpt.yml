@@ -125,9 +125,6 @@ jobs:
                   return False
 
           queue = [p for p in root.rglob('*') if is_elf(p)]
-          # Also bundle the Pixi Python executable so scripts can run through a
-          # genuinely relocatable Python entry point rather than relying only on
-          # FreeCADCmd's embedded interpreter metadata.
           pyroot = root / 'python'
           (pyroot / 'bin').mkdir(parents=True, exist_ok=True)
           pyexe_src = prefix / 'bin' / 'python3.11'
@@ -170,15 +167,15 @@ jobs:
                   if needed_name != real_name:
                       aliases[needed_name] = real_name
 
-          # Create every loader-visible SONAME alias (e.g. libQt6Core.so.6 ->
-          # libQt6Core.so.6.8.3). The previous artifact copied only resolved
-          # files, which worked on the runner because the original symlinks were
-          # still present but failed after extraction elsewhere.
+          # GitHub Actions artifacts do not preserve symlink semantics reliably.
+          # Store every SONAME alias as a real file so the downloaded artifact
+          # still contains loader-visible names such as libQt6Core.so.6.
           for alias, target in sorted(aliases.items()):
-              link = runtime / alias
-              if link.exists() or link.is_symlink():
-                  link.unlink()
-              link.symlink_to(target)
+              alias_path = runtime / alias
+              target_path = runtime / target
+              if alias_path.exists() or alias_path.is_symlink():
+                  alias_path.unlink()
+              shutil.copy2(target_path, alias_path)
 
           py_src = prefix / 'lib' / 'python3.11'
           py_dst = pyroot / 'lib' / 'python3.11'
@@ -191,7 +188,7 @@ jobs:
               '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n', encoding='utf-8')
           (root / 'RUNTIME_ALIASES.txt').write_text(
               '\n'.join(f'{k}\t{v}' for k, v in sorted(aliases.items())) + '\n', encoding='utf-8')
-          print(f'Copied {len(copied)} runtime libraries and created {len(aliases)} aliases')
+          print(f'Copied {len(copied)} runtime libraries and materialized {len(aliases)} aliases')
           PY
 
       - name: Create portable launchers and test artifact
@@ -218,8 +215,6 @@ jobs:
           EOF
           chmod +x freecad-headless/freecadcmd.sh freecad-headless/freecad-python.sh
 
-          # Simulate extraction on a foreign machine: move the artifact away from
-          # its build location, hide the Pixi prefix, and execute from /tmp.
           rm -rf /tmp/freecad-portable-test
           cp -a freecad-headless /tmp/freecad-portable-test
           env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
