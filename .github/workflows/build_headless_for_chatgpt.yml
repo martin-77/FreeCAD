@@ -42,7 +42,6 @@ jobs:
           if old not in s:
               raise SystemExit('Expected SetupQt.cmake component line not found')
           p.write_text(s.replace(old, new, 1))
-          print('Enabled Qt LinguistTools for BUILD_GUI=OFF headless build')
           PY
 
       - name: Configure headless FreeCAD
@@ -105,10 +104,10 @@ jobs:
         run: |
           pixi run bash -lc '
             export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; print(FreeCAD.Version()); s=Part.makeBox(10,20,30); print(s.Volume); assert abs(s.Volume-6000.0)<1e-6"
+            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part; s=Part.makeBox(10,20,30); print(FreeCAD.Version()); print(s.Volume); assert abs(s.Volume-6000.0)<1e-6"
           '
 
-      - name: Collect minimal runtime dependencies
+      - name: Collect portable runtime
         shell: bash
         run: |
           pixi run python - <<'PY'
@@ -119,23 +118,34 @@ jobs:
           runtime = root / 'runtime-lib'
           runtime.mkdir(exist_ok=True)
 
-          queue = []
-          for p in root.rglob('*'):
-              if p.is_file():
-                  try:
-                      magic = p.read_bytes()[:4]
-                  except OSError:
-                      continue
-                  if magic == b'\x7fELF':
-                      queue.append(p)
+          def is_elf(p):
+              try:
+                  return p.is_file() and p.read_bytes()[:4] == b'\x7fELF'
+              except OSError:
+                  return False
+
+          queue = [p for p in root.rglob('*') if is_elf(p)]
+          # Also bundle the Pixi Python executable so scripts can run through a
+          # genuinely relocatable Python entry point rather than relying only on
+          # FreeCADCmd's embedded interpreter metadata.
+          pyroot = root / 'python'
+          (pyroot / 'bin').mkdir(parents=True, exist_ok=True)
+          pyexe_src = prefix / 'bin' / 'python3.11'
+          pyexe_dst = pyroot / 'bin' / 'python3.11'
+          shutil.copy2(pyexe_src, pyexe_dst)
+          queue.append(pyexe_dst)
 
           seen = set()
           copied = {}
-          dep_re = re.compile(r'=>\s+(/[^ ]+)')
+          aliases = {}
+          dep_re = re.compile(r'^\s*([^\s]+)\s+=>\s+(/[^ ]+)', re.M)
 
           while queue:
               obj = queue.pop()
-              key = str(obj.resolve())
+              try:
+                  key = str(obj.resolve())
+              except OSError:
+                  continue
               if key in seen:
                   continue
               seen.add(key)
@@ -144,36 +154,47 @@ jobs:
               except Exception:
                   continue
               for m in dep_re.finditer(out):
-                  dep = pathlib.Path(m.group(1))
+                  needed_name, dep_path = m.group(1), pathlib.Path(m.group(2))
                   try:
-                      dep_res = dep.resolve()
+                      dep_res = dep_path.resolve()
                   except OSError:
                       continue
                   if not str(dep_res).startswith(str(prefix) + os.sep):
                       continue
-                  name = dep_res.name
-                  dst = runtime / name
-                  if name not in copied:
+                  real_name = dep_res.name
+                  dst = runtime / real_name
+                  if real_name not in copied:
                       shutil.copy2(dep_res, dst)
-                      copied[name] = str(dep_res)
+                      copied[real_name] = str(dep_res)
                       queue.append(dst)
+                  if needed_name != real_name:
+                      aliases[needed_name] = real_name
+
+          # Create every loader-visible SONAME alias (e.g. libQt6Core.so.6 ->
+          # libQt6Core.so.6.8.3). The previous artifact copied only resolved
+          # files, which worked on the runner because the original symlinks were
+          # still present but failed after extraction elsewhere.
+          for alias, target in sorted(aliases.items()):
+              link = runtime / alias
+              if link.exists() or link.is_symlink():
+                  link.unlink()
+              link.symlink_to(target)
 
           py_src = prefix / 'lib' / 'python3.11'
-          py_dst = root / 'python' / 'lib' / 'python3.11'
-          if py_src.exists():
-              def ignore(path, names):
-                  blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
-                  return [n for n in names if n in blocked or n == '__pycache__']
-              shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
+          py_dst = pyroot / 'lib' / 'python3.11'
+          def ignore(path, names):
+              blocked = {'site-packages', 'test', 'tests', 'tkinter', 'idlelib', 'ensurepip'}
+              return [n for n in names if n in blocked or n == '__pycache__']
+          shutil.copytree(py_src, py_dst, dirs_exist_ok=True, ignore=ignore)
 
           (root / 'RUNTIME_LIBS.txt').write_text(
-              '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n',
-              encoding='utf-8'
-          )
-          print(f'Copied {len(copied)} runtime libraries')
+              '\n'.join(f'{k}\t{v}' for k, v in sorted(copied.items())) + '\n', encoding='utf-8')
+          (root / 'RUNTIME_ALIASES.txt').write_text(
+              '\n'.join(f'{k}\t{v}' for k, v in sorted(aliases.items())) + '\n', encoding='utf-8')
+          print(f'Copied {len(copied)} runtime libraries and created {len(aliases)} aliases')
           PY
 
-      - name: Create portable launcher and test artifact
+      - name: Create portable launchers and test artifact
         shell: bash
         run: |
           cat > freecad-headless/freecadcmd.sh <<'EOF'
@@ -185,15 +206,49 @@ jobs:
           export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
           exec "$HERE/bin/FreeCADCmd" "$@"
           EOF
-          chmod +x freecad-headless/freecadcmd.sh
+
+          cat > freecad-headless/freecad-python.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/runtime-lib:$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PYTHONHOME="$HERE/python"
+          export PYTHONPATH="$HERE/lib:$HERE/Mod${PYTHONPATH:+:$PYTHONPATH}"
+          exec "$HERE/python/bin/python3.11" "$@"
+          EOF
+          chmod +x freecad-headless/freecadcmd.sh freecad-headless/freecad-python.sh
+
+          # Simulate extraction on a foreign machine: move the artifact away from
+          # its build location, hide the Pixi prefix, and execute from /tmp.
+          rm -rf /tmp/freecad-portable-test
+          cp -a freecad-headless /tmp/freecad-portable-test
+          env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
+            LD_LIBRARY_PATH="" \
+            /tmp/freecad-portable-test/freecadcmd.sh -c \
+            "import FreeCAD, Part; s=Part.makeCylinder(6.21,20); print(FreeCAD.Version()); assert s.Volume>2400"
 
           env -u CONDA_PREFIX -u PYTHONPATH -u PYTHONHOME \
             LD_LIBRARY_PATH="" \
-            ./freecad-headless/freecadcmd.sh -c \
-            "import FreeCAD, Part; print(FreeCAD.Version()); s=Part.makeCylinder(6.21,20); print(round(s.Volume,3)); assert s.Volume>2400"
+            /tmp/freecad-portable-test/freecad-python.sh - <<'PY'
+          import os, sys, tempfile
+          import FreeCAD, Part
+          assert '/home/runner/' not in sys.prefix, sys.prefix
+          shape = Part.makeBox(10, 20, 30)
+          assert abs(shape.Volume - 6000.0) < 1e-6
+          fd, path = tempfile.mkstemp(suffix='.step')
+          os.close(fd)
+          try:
+              shape.exportStep(path)
+              reread = Part.read(path)
+              assert reread.isValid()
+              assert abs(reread.Volume - 6000.0) < 1e-4
+          finally:
+              os.unlink(path)
+          print('Portable Python + FreeCAD + STEP roundtrip OK')
+          PY
 
           du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
-          find freecad-headless -type f | sort > freecad-headless/FILELIST.txt
+          find freecad-headless -type f -o -type l | sort > freecad-headless/FILELIST.txt
 
       - name: Upload headless FreeCAD
         uses: actions/upload-artifact@v4
