@@ -1,4 +1,4 @@
-name: Build Headless FreeCAD for CAD checks
+name: Package portable FreeCAD for ChatGPT
 
 on:
   workflow_dispatch:
@@ -9,274 +9,53 @@ on:
 permissions:
   contents: read
 
-env:
-  PIXI_VERSION: v0.68.1
-
 jobs:
-  build-headless-linux:
+  package-freecad-linux:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout FreeCAD including submodules
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: recursive
-          fetch-depth: 1
-
-      - name: Install repository Pixi environment
-        uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-
-      - name: Prepare headless Qt helpers
+      - name: Download official FreeCAD 1.1.3 AppImage
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('cMake/FreeCAD_Helpers/SetupQt.cmake')
-          s = p.read_text()
-          old = 'set(FREECAD_QT_COMPONENTS Core Concurrent Network Xml)'
-          new = 'set(FREECAD_QT_COMPONENTS Core Concurrent Network Xml LinguistTools)'
-          if old not in s:
-              raise SystemExit('Expected SetupQt.cmake component line not found')
-          p.write_text(s.replace(old, new, 1))
-          PY
+          set -euo pipefail
+          URL='https://github.com/FreeCAD/FreeCAD/releases/download/1.1.3/FreeCAD_1.1.3-Linux-x86_64-py311.AppImage'
+          curl -fL --retry 5 --retry-delay 2 -o FreeCAD.AppImage "$URL"
+          echo '3a853eb69ee595f779f2255dbf80a765926981d8ff68903cefee4dfb03a8f5ef  FreeCAD.AppImage' | sha256sum -c -
+          chmod +x FreeCAD.AppImage
 
-      - name: Configure headless FreeCAD
+      - name: Extract and smoke-test headless CAD modules
         shell: bash
         run: |
-          pixi run bash -lc '
-            cmake -S . -B build-headless -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX="$PWD/freecad-headless" \
-              -DBUILD_GUI=OFF \
-              -DBUILD_FEM=OFF \
-              -DBUILD_TEMPLATE=OFF \
-              -DBUILD_ADDONMGR=OFF \
-              -DBUILD_BIM=OFF \
-              -DBUILD_DRAFT=OFF \
-              -DBUILD_HELP=OFF \
-              -DBUILD_IMPORT=ON \
-              -DBUILD_INSPECTION=OFF \
-              -DBUILD_MATERIAL=ON \
-              -DBUILD_MESH=ON \
-              -DBUILD_MESH_PART=OFF \
-              -DBUILD_FLAT_MESH=OFF \
-              -DBUILD_OPENSCAD=OFF \
-              -DBUILD_PART=ON \
-              -DBUILD_PART_DESIGN=ON \
-              -DBUILD_CAM=OFF \
-              -DBUILD_ASSEMBLY=OFF \
-              -DBUILD_PLOT=OFF \
-              -DBUILD_POINTS=OFF \
-              -DBUILD_REVERSEENGINEERING=OFF \
-              -DBUILD_ROBOT=OFF \
-              -DBUILD_SHOW=OFF \
-              -DBUILD_SKETCHER=ON \
-              -DBUILD_SPREADSHEET=OFF \
-              -DBUILD_START=OFF \
-              -DBUILD_TEST=OFF \
-              -DBUILD_MEASURE=OFF \
-              -DBUILD_TECHDRAW=OFF \
-              -DBUILD_TUX=OFF \
-              -DBUILD_WEB=OFF \
-              -DBUILD_SURFACE=OFF \
-              -DENABLE_DEVELOPER_TESTS=OFF \
-              -DFREECAD_USE_PCL=OFF \
-              -DFREECAD_USE_EXTERNAL_SMESH=OFF \
-              -DBUILD_FEM_NETGEN=OFF \
-              -DFREECAD_USE_3DCONNEXION_LEGACY=OFF \
-              -DINSTALL_TO_SITEPACKAGES=OFF
-          '
+          set -euo pipefail
+          ./FreeCAD.AppImage --appimage-extract >/dev/null
+          CMD="$(find "$PWD/squashfs-root" -type f \( -name FreeCADCmd -o -name freecadcmd \) -perm -111 | head -n1)"
+          test -n "$CMD"
+          echo "FreeCADCmd=$CMD"
+          "$CMD" -c 'import FreeCAD, Part, PartDesign, Sketcher, Mesh; s=Part.makeBox(10,20,30); assert s.isValid(); assert abs(s.Volume-6000.0)<1e-6; print(FreeCAD.Version()); print("HEADLESS MODULES OK")'
 
-      - name: Build and install
+      - name: Create portable extraction helper
         shell: bash
         run: |
-          pixi run bash -lc '
-            cmake --build build-headless --parallel 2
-            cmake --install build-headless
-          '
+          cat > README-CHATGPT.txt <<'EOF'
+          Official FreeCAD 1.1.3 Linux x86_64 AppImage (Python 3.11).
+          SHA256: 3a853eb69ee595f779f2255dbf80a765926981d8ff68903cefee4dfb03a8f5ef
 
-      - name: Smoke test in build environment
-        shell: bash
-        run: |
-          pixi run bash -lc '
-            export LD_LIBRARY_PATH="$PWD/freecad-headless/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            "$PWD/freecad-headless/bin/FreeCADCmd" -c "import FreeCAD, Part, PartDesign, Sketcher, Mesh; s=Part.makeBox(10,20,30); print(FreeCAD.Version()); print(s.Volume); assert s.isValid(); assert abs(s.Volume-6000.0)<1e-6"
-          '
+          In a container without FUSE:
+            chmod +x FreeCAD.AppImage
+            ./FreeCAD.AppImage --appimage-extract
+            find squashfs-root -type f -name 'FreeCADCmd' -perm -111
 
-      - name: Collect self-contained runtime
-        shell: bash
-        run: |
-          pixi run bash -lc '
-            set -euo pipefail
-            mkdir -p freecad-headless/runtime/bin
-            cp -a "$CONDA_PREFIX/lib" freecad-headless/runtime/lib
-            cp -a "$CONDA_PREFIX/share" freecad-headless/runtime/share
-            cp -a "$CONDA_PREFIX/bin/python3.11" freecad-headless/runtime/bin/python3.11
-            for d in ssl etc; do
-              if [ -d "$CONDA_PREFIX/$d" ]; then
-                cp -a "$CONDA_PREFIX/$d" "freecad-headless/runtime/$d"
-              fi
-            done
-          '
-
-      - name: Create launchers and CAD validation suite
-        shell: bash
-        run: |
-          cat > freecad-headless/env.sh <<'EOF'
-          #!/usr/bin/env bash
-          FREECAD_PORTABLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export FREECAD_PORTABLE_ROOT
-          export PATH="$FREECAD_PORTABLE_ROOT/runtime/bin:$FREECAD_PORTABLE_ROOT/bin${PATH:+:$PATH}"
-          export LD_LIBRARY_PATH="$FREECAD_PORTABLE_ROOT/lib:$FREECAD_PORTABLE_ROOT/runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export PYTHONHOME="$FREECAD_PORTABLE_ROOT/runtime"
-          export PYTHONPATH="$FREECAD_PORTABLE_ROOT/lib:$FREECAD_PORTABLE_ROOT/Mod${PYTHONPATH:+:$PYTHONPATH}"
-          export XDG_DATA_DIRS="$FREECAD_PORTABLE_ROOT/runtime/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-          [ -d "$FREECAD_PORTABLE_ROOT/runtime/lib/qt6/plugins" ] && export QT_PLUGIN_PATH="$FREECAD_PORTABLE_ROOT/runtime/lib/qt6/plugins"
-          [ -f "$FREECAD_PORTABLE_ROOT/runtime/ssl/cacert.pem" ] && export SSL_CERT_FILE="$FREECAD_PORTABLE_ROOT/runtime/ssl/cacert.pem"
-          unset CONDA_PREFIX CONDA_DEFAULT_ENV
+          The GitHub Actions smoke test imports FreeCAD, Part, PartDesign, Sketcher and Mesh.
           EOF
 
-          cat > freecad-headless/freecad-python.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-          source "$HERE/env.sh"
-          exec "$HERE/runtime/bin/python3.11" "$@"
-          EOF
-
-          cat > freecad-headless/freecadcmd.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-          source "$HERE/env.sh"
-          exec "$HERE/bin/FreeCADCmd" "$@"
-          EOF
-
-          cat > freecad-headless/validate-cad.py <<'PY'
-          """Portable FreeCAD acceptance test used by CI and after extraction."""
-          from __future__ import annotations
-
-          import math
-          import tempfile
-          from pathlib import Path
-
-          import FreeCAD
-          import Part
-          import PartDesign
-          import Sketcher
-          import Mesh
-
-          with tempfile.TemporaryDirectory(prefix="freecad-portable-") as tmp:
-              tmpdir = Path(tmp)
-              fcstd = tmpdir / "roundtrip.FCStd"
-              step = tmpdir / "roundtrip.step"
-              stl = tmpdir / "roundtrip.stl"
-
-              base = Part.makeBox(40, 30, 12)
-              boss = Part.makeCylinder(8, 18, FreeCAD.Vector(20, 15, 12))
-              hole = Part.makeCylinder(3, 30, FreeCAD.Vector(20, 15, 0))
-              shape = base.fuse(boss).cut(hole)
-              assert shape.isValid(), "constructed BRep is invalid"
-              assert shape.Volume > 0
-              bbox = shape.BoundBox
-              assert math.isclose(bbox.XLength, 40.0, abs_tol=1e-7)
-              assert math.isclose(bbox.YLength, 30.0, abs_tol=1e-7)
-              assert math.isclose(bbox.ZLength, 30.0, abs_tol=1e-7)
-
-              doc = FreeCAD.newDocument("PortableRoundtrip")
-              obj = doc.addObject("PartDesign::Feature", "Fixture")
-              obj.Label = "Portable CAD validation fixture"
-              obj.addProperty("App::PropertyLength", "ReferenceLength", "Validation")
-              obj.ReferenceLength = 40
-              obj.Shape = shape
-
-              sketch = doc.addObject("Sketcher::SketchObject", "SketchSmoke")
-              sketch.addGeometry(
-                  Part.LineSegment(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(10, 0, 0)),
-                  False,
-              )
-              assert sketch.GeometryCount == 1
-
-              doc.recompute()
-              doc.saveAs(str(fcstd))
-              expected_volume = obj.Shape.Volume
-              FreeCAD.closeDocument(doc.Name)
-
-              reopened = FreeCAD.openDocument(str(fcstd))
-              loaded = reopened.getObject("Fixture")
-              assert loaded is not None
-              assert loaded.Shape.isValid()
-              assert math.isclose(loaded.Shape.Volume, expected_volume, rel_tol=0, abs_tol=1e-6)
-              assert math.isclose(loaded.ReferenceLength.Value, 40.0, abs_tol=1e-9)
-              assert reopened.getObject("SketchSmoke").GeometryCount == 1
-
-              # STEP export/import through OpenCascade.
-              loaded.Shape.exportStep(str(step))
-              reread = Part.Shape()
-              reread.read(str(step))
-              assert reread.isValid()
-              assert math.isclose(reread.Volume, expected_volume, rel_tol=0, abs_tol=1e-3)
-
-              # STL export through FreeCAD's Mesh module.
-              Mesh.export([loaded], str(stl))
-              assert stl.stat().st_size > 100
-              FreeCAD.closeDocument(reopened.Name)
-
-              print("FreeCAD version:", FreeCAD.Version())
-              print("FCStd bytes:", fcstd.stat().st_size)
-              print("STEP bytes:", step.stat().st_size)
-              print("STL bytes:", stl.stat().st_size)
-              print("Volume:", expected_volume)
-              print("Portable FCStd + STEP + STL CAD validation OK")
-          PY
-
-          chmod +x freecad-headless/env.sh freecad-headless/freecad-python.sh freecad-headless/freecadcmd.sh
-
-      - name: Test relocated artifact with clean environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/freecad-portable-test
-          cp -a freecad-headless /tmp/freecad-portable-test
-
-          env -i \
-            HOME="$HOME" \
-            USER="$USER" \
-            PATH="/usr/bin:/bin" \
-            LANG="C.UTF-8" \
-            /tmp/freecad-portable-test/freecad-python.sh \
-            /tmp/freecad-portable-test/validate-cad.py
-
-          env -i \
-            HOME="$HOME" \
-            USER="$USER" \
-            PATH="/usr/bin:/bin" \
-            LANG="C.UTF-8" \
-            /tmp/freecad-portable-test/freecadcmd.sh -c \
-            "import FreeCAD, Part, PartDesign, Sketcher, Mesh; s=Part.makeBox(2,3,4); assert s.isValid(); print(s.Volume); assert abs(s.Volume-24)<1e-6"
-
-          # Runtime execution above is the authoritative relocation test. Do not
-          # reject harmless compiler/debug strings containing the old build path.
-          du -sh freecad-headless | tee freecad-headless/ARTIFACT_SIZE.txt
-          find freecad-headless \( -type f -o -type l \) -print | sort > freecad-headless/FILELIST.txt
-
-      - name: Pack portable runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar -czf freecad-headless-linux-x86_64.tar.gz freecad-headless
-          tar -tzf freecad-headless-linux-x86_64.tar.gz >/dev/null
-          test -s freecad-headless-linux-x86_64.tar.gz
-
-      - name: Upload headless FreeCAD
+      - name: Upload portable FreeCAD
         uses: actions/upload-artifact@v4
         with:
-          name: freecad-headless-linux-x86_64
-          path: freecad-headless-linux-x86_64.tar.gz
+          name: freecad-1.1.3-linux-x86_64-appimage
+          path: |
+            FreeCAD.AppImage
+            README-CHATGPT.txt
           compression-level: 0
           retention-days: 14
           if-no-files-found: error
