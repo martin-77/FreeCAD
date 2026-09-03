@@ -34,28 +34,52 @@ jobs:
           echo "FreeCADCmd=$CMD"
           "$CMD" -c 'import FreeCAD, Part, PartDesign, Sketcher, Mesh; s=Part.makeBox(10,20,30); assert s.isValid(); assert abs(s.Volume-6000.0)<1e-6; print(FreeCAD.Version()); print("HEADLESS MODULES OK")'
 
-      - name: Create portable extraction helper
+      - name: Split verified AppImage for connector transport
         shell: bash
         run: |
-          cat > README-CHATGPT.txt <<'EOF'
-          Official FreeCAD 1.1.3 Linux x86_64 AppImage (Python 3.11).
-          SHA256: 3a853eb69ee595f779f2255dbf80a765926981d8ff68903cefee4dfb03a8f5ef
+          set -euo pipefail
+          mkdir chunks
+          split -b 190M -d -a 2 FreeCAD.AppImage chunks/FreeCAD.AppImage.part.
+          test -f chunks/FreeCAD.AppImage.part.00
+          test -f chunks/FreeCAD.AppImage.part.01
+          test -f chunks/FreeCAD.AppImage.part.02
+          test -f chunks/FreeCAD.AppImage.part.03
+          test -f chunks/FreeCAD.AppImage.part.04
+          cat chunks/FreeCAD.AppImage.part.* | sha256sum | grep -q '^3a853eb69ee595f779f2255dbf80a765926981d8ff68903cefee4dfb03a8f5ef '
+          ls -lh chunks
 
-          In a container without FUSE:
-            chmod +x FreeCAD.AppImage
-            ./FreeCAD.AppImage --appimage-extract
-            find squashfs-root -type f -name 'FreeCADCmd' -perm -111
-
-          The GitHub Actions smoke test imports FreeCAD, Part, PartDesign, Sketcher and Mesh.
-          EOF
-
-      - name: Upload portable FreeCAD
+      - name: Upload part 00
         uses: actions/upload-artifact@v4
         with:
-          name: freecad-1.1.3-linux-x86_64-appimage
-          path: |
-            FreeCAD.AppImage
-            README-CHATGPT.txt
+          name: freecad-appimage-part-00
+          path: chunks/FreeCAD.AppImage.part.00
           compression-level: 0
           retention-days: 14
-          if-no-files-found: error
+      - name: Upload part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecad-appimage-part-01
+          path: chunks/FreeCAD.AppImage.part.01
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecad-appimage-part-02
+          path: chunks/FreeCAD.AppImage.part.02
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecad-appimage-part-03
+          path: chunks/FreeCAD.AppImage.part.03
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 04
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecad-appimage-part-04
+          path: chunks/FreeCAD.AppImage.part.04
+          compression-level: 0
+          retention-days: 14
